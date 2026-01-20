@@ -107,39 +107,125 @@ app.post('/sendNotification', async (req, res) => {
   });
 });
 
+// Función para obtener la fecha/hora en una zona horaria específica
+function getDateInTimezone(timezone = 'America/Argentina/Buenos_Aires') {
+  const now = new Date();
+  // Convertir a string en la zona horaria especificada
+  const dateString = now.toLocaleString('en-US', { 
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+  
+  // Parsear la fecha string (formato: MM/DD/YYYY, HH:MM:SS)
+  const [datePart, timePart] = dateString.split(', ');
+  const [month, day, year] = datePart.split('/');
+  const [hour, minute, second] = timePart.split(':');
+  
+  // Crear una fecha en UTC que represente la hora local en la zona horaria especificada
+  const localDate = new Date(Date.UTC(
+    parseInt(year),
+    parseInt(month) - 1,
+    parseInt(day),
+    parseInt(hour),
+    parseInt(minute),
+    parseInt(second)
+  ));
+  
+  return {
+    date: localDate,
+    day: localDate.getUTCDay(), // 0 = domingo, 1 = lunes, etc.
+    hour: parseInt(hour),
+    minute: parseInt(minute),
+    timeString: `${hour}:${minute}`,
+    fullString: dateString
+  };
+}
+
 // Función para obtener usuarios que deben recibir notificaciones
 async function obtenerUsuariosParaNotificar() {
   const db = admin.firestore();
-  const now = new Date();
-  const currentDay = now.getDay(); // 0 = domingo, 1 = lunes, etc.
-  const currentHour = now.getHours();
-  const currentMinute = now.getMinutes();
-  const currentTime = `${String(currentHour).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}`;
+  const TIMEZONE = 'America/Argentina/Buenos_Aires';
+  const timeInfo = getDateInTimezone(TIMEZONE);
+  const currentDay = timeInfo.day;
+  const currentTime = timeInfo.timeString;
+
+  console.log(`[DEBUG] Zona horaria: ${TIMEZONE}`);
+  console.log(`[DEBUG] Fecha/hora local: ${timeInfo.fullString}`);
+  console.log(`[DEBUG] Día de la semana: ${currentDay} (0=Dom, 1=Lun, 2=Mar, etc.)`);
+  console.log(`[DEBUG] Hora actual: ${currentTime}`);
 
   try {
     const usersSnapshot = await db.collection('users').get();
     const usersToNotify = [];
+    let totalUsers = 0;
+    let usersWithConfig = 0;
+    let usersActive = 0;
+    let usersWithToken = 0;
+    let usersDayMatch = 0;
+    let usersTimeMatch = 0;
 
     for (const userDoc of usersSnapshot.docs) {
+      totalUsers++;
       const userData = userDoc.data();
       const config = userData.notificationConfig;
       const pushToken = userData.pushToken;
 
-      // Verificar si el usuario tiene notificaciones activas
-      if (config && config.activa && config.tipo === 'push' && pushToken) {
-        // Verificar si el día actual está en los días configurados
-        if (config.dias && config.dias.includes(currentDay)) {
-          // Verificar si la hora coincide
-          if (config.hora === currentTime) {
-            usersToNotify.push({
-              userId: userDoc.id,
-              token: pushToken,
-              config: config
-            });
+      // Verificar si el usuario tiene configuración
+      if (config) {
+        usersWithConfig++;
+        console.log(`[DEBUG] Usuario ${userDoc.id}: config encontrada`, {
+          activa: config.activa,
+          tipo: config.tipo,
+          dias: config.dias,
+          hora: config.hora,
+          tieneToken: !!pushToken
+        });
+
+        // Verificar si el usuario tiene notificaciones activas
+        if (config.activa && config.tipo === 'push') {
+          usersActive++;
+          
+          if (pushToken) {
+            usersWithToken++;
+            
+            // Verificar si el día actual está en los días configurados
+            if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
+              usersDayMatch++;
+              console.log(`[DEBUG] Usuario ${userDoc.id}: Día coincide (${currentDay} está en [${config.dias.join(', ')}])`);
+              
+              // Verificar si la hora coincide
+              if (config.hora === currentTime) {
+                usersTimeMatch++;
+                console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: HORA COINCIDE! (${config.hora} === ${currentTime})`);
+                usersToNotify.push({
+                  userId: userDoc.id,
+                  token: pushToken,
+                  config: config
+                });
+              } else {
+                console.log(`[DEBUG] Usuario ${userDoc.id}: Hora NO coincide (${config.hora} !== ${currentTime})`);
+              }
+            } else {
+              console.log(`[DEBUG] Usuario ${userDoc.id}: Día NO coincide (${currentDay} no está en [${config.dias ? config.dias.join(', ') : 'sin días'}])`);
+            }
+          } else {
+            console.log(`[DEBUG] Usuario ${userDoc.id}: No tiene pushToken`);
           }
+        } else {
+          console.log(`[DEBUG] Usuario ${userDoc.id}: Notificaciones inactivas o tipo diferente (activa: ${config.activa}, tipo: ${config.tipo})`);
         }
+      } else {
+        console.log(`[DEBUG] Usuario ${userDoc.id}: No tiene notificationConfig`);
       }
     }
+
+    console.log(`[DEBUG] Resumen: Total usuarios: ${totalUsers}, Con config: ${usersWithConfig}, Activos: ${usersActive}, Con token: ${usersWithToken}, Día match: ${usersDayMatch}, Hora match: ${usersTimeMatch}, Para notificar: ${usersToNotify.length}`);
 
     return usersToNotify;
   } catch (error) {
