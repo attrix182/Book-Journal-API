@@ -193,8 +193,9 @@ function getDateInTimezone(timezone = 'America/Argentina/Buenos_Aires') {
 // Optimizada para usar campos calculados y consultas de Firestore más eficientes
 // 
 // OPTIMIZACIONES APLICADAS:
-// 1. Cron job ejecuta cada 15 minutos (en :00, :15, :30, :45) en lugar de cada minuto
-//    - Reduce consultas de 1440/día a 96/día (93% menos)
+// 1. Cron job ejecuta cada hora (en :00 de cada hora, ej: 09:00, 10:00, 11:00)
+//    - Reduce consultas de 1440/día a 24/día (98% menos)
+//    - Solo permite horarios en punto (minutos = 00) - validado en frontend
 // 2. Campos calculados (notificationActive, notificationType, notificationHour, notificationDays)
 //    - Permiten filtrar en Firestore antes de traer documentos
 // 3. Consultas con where() para filtrar usuarios activos
@@ -478,18 +479,19 @@ async function enviarNotificacionesProgramadas() {
   }
 }
 
-// Configurar cron job para verificar cada 15 minutos (en :00, :15, :30, :45)
+// Configurar cron job para verificar cada hora (en :00 de cada hora)
 // El formato es: segundo minuto hora día mes día-semana
-// '0 */15 * * * *' = cada 15 minutos en los minutos 0, 15, 30, 45
-// Esto reduce significativamente las consultas a Firestore (de 1440/día a 96/día)
-cron.schedule('0 */15 * * * *', async () => {
+// '0 0 * * * *' = cada hora en el minuto 0 (ej: 09:00, 10:00, 11:00, etc.)
+// Esto reduce las consultas a Firestore de 1440/día a 24/día (98% menos)
+// El frontend valida que solo se permitan horas en punto (minutos = 00)
+cron.schedule('0 0 * * * *', async () => {
   await enviarNotificacionesProgramadas();
 }, {
   scheduled: true,
   timezone: "America/Argentina/Buenos_Aires"
 });
 
-console.log('Cron job configurado para verificar notificaciones cada 15 minutos (en :00, :15, :30, :45)');
+console.log('Cron job configurado para verificar notificaciones cada hora (en :00 de cada hora)');
 
 // Obtener el puerto de la variable de entorno o usar 3000 por defecto
 const PORT = process.env.PORT || 3000;
