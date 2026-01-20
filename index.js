@@ -6,6 +6,7 @@ const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const cron = require('node-cron');
+const nodemailer = require('nodemailer');
 
 // Inicializar la app de Firebase
 // Intentar leer desde variable de entorno (Render) o archivo local
@@ -27,6 +28,47 @@ if (process.env.FIREBASE_CONFIG) {
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
+
+// Configurar transporter de nodemailer para SMTP
+// Las credenciales se obtienen de variables de entorno
+let emailTransporter = null;
+
+function inicializarEmailTransporter() {
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpPort = process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT) : 587;
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPassword = process.env.SMTP_PASSWORD;
+  const smtpFrom = process.env.SMTP_FROM || smtpUser; // Email remitente (por defecto el mismo usuario)
+  const smtpSecure = process.env.SMTP_SECURE === 'true'; // true para puerto 465, false para 587
+
+  if (!smtpHost || !smtpUser || !smtpPassword) {
+    console.warn('[SMTP] Configuración SMTP incompleta. Variables requeridas: SMTP_HOST, SMTP_USER, SMTP_PASSWORD');
+    console.warn('[SMTP] Variables opcionales: SMTP_PORT (default: 587), SMTP_FROM, SMTP_SECURE (default: false)');
+    return null;
+  }
+
+  try {
+    emailTransporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure, // true para 465, false para otros puertos
+      auth: {
+        user: smtpUser,
+        pass: smtpPassword
+      }
+    });
+
+    console.log('[SMTP] Transporter de email configurado correctamente');
+    console.log(`[SMTP] Host: ${smtpHost}, Port: ${smtpPort}, From: ${smtpFrom}`);
+    return emailTransporter;
+  } catch (error) {
+    console.error('[SMTP] Error al configurar transporter:', error);
+    return null;
+  }
+}
+
+// Inicializar transporter al arrancar
+inicializarEmailTransporter();
 
 const app = express();
 
@@ -147,7 +189,20 @@ function getDateInTimezone(timezone = 'America/Argentina/Buenos_Aires') {
   };
 }
 
-// Función para obtener usuarios que deben recibir notificaciones
+// Función para obtener usuarios que deben recibir notificaciones (push y email)
+// Optimizada para usar campos calculados y consultas de Firestore más eficientes
+// 
+// OPTIMIZACIONES APLICADAS:
+// 1. Cron job ejecuta cada 15 minutos (en :00, :15, :30, :45) en lugar de cada minuto
+//    - Reduce consultas de 1440/día a 96/día (93% menos)
+// 2. Campos calculados (notificationActive, notificationType, notificationHour, notificationDays)
+//    - Permiten filtrar en Firestore antes de traer documentos
+// 3. Consultas con where() para filtrar usuarios activos
+//    - Solo trae usuarios con notificaciones activas (push o email)
+// 
+// NOTA: Para mejor rendimiento, crear un índice compuesto en Firestore:
+// Collection: users
+// Fields: notificationActive (Ascending), notificationType (Ascending)
 async function obtenerUsuariosParaNotificar() {
   const db = admin.firestore();
   const TIMEZONE = 'America/Argentina/Buenos_Aires';
@@ -161,140 +216,280 @@ async function obtenerUsuariosParaNotificar() {
   console.log(`[DEBUG] Hora actual: ${currentTime}`);
 
   try {
-    const usersSnapshot = await db.collection('users').get();
-    const usersToNotify = [];
+    // OPTIMIZACIÓN: Usar consultas de Firestore para filtrar antes de traer datos
+    // Obtener usuarios con notificaciones activas (tanto push como email)
+    // Usamos los campos calculados: notificationActive
+    // Nota: Firestore no permite múltiples where() con != null, así que filtramos pushToken/email después
+    
+    // Obtener usuarios con notificaciones activas (push o email)
+    let usersQuery = db.collection('users')
+      .where('notificationActive', '==', true);
+
+    const usersSnapshot = await usersQuery.get();
+    
+    // Si no hay resultados con los campos calculados, hacer fallback a consulta completa
+    // (para usuarios antiguos que no tienen los campos calculados)
+    let usersToNotifyPush = [];
+    let usersToNotifyEmail = [];
     let totalUsers = 0;
     let usersWithConfig = 0;
     let usersActive = 0;
     let usersWithToken = 0;
+    let usersWithEmail = 0;
     let usersDayMatch = 0;
     let usersTimeMatch = 0;
 
-    for (const userDoc of usersSnapshot.docs) {
-      totalUsers++;
-      const userData = userDoc.data();
-      const config = userData.notificationConfig;
-      const pushToken = userData.pushToken;
+    if (usersSnapshot.empty) {
+      console.log('[DEBUG] No se encontraron usuarios con campos calculados, usando fallback...');
+      // Fallback: consulta completa pero filtrada
+      const allUsersSnapshot = await db.collection('users').get();
+      
+      for (const userDoc of allUsersSnapshot.docs) {
+        totalUsers++;
+        const userData = userDoc.data();
+        const config = userData.notificationConfig;
+        const pushToken = userData.pushToken;
 
-      // Verificar si el usuario tiene configuración
-      if (config) {
-        usersWithConfig++;
-        console.log(`[DEBUG] Usuario ${userDoc.id}: config encontrada`, {
-          activa: config.activa,
-          tipo: config.tipo,
-          dias: config.dias,
-          hora: config.hora,
-          tieneToken: !!pushToken
-        });
-
-        // Verificar si el usuario tiene notificaciones activas
-        if (config.activa && config.tipo === 'push') {
+        if (config && config.activa) {
+          usersWithConfig++;
           usersActive++;
           
-          if (pushToken) {
-            usersWithToken++;
-            
-            // Verificar si el día actual está en los días configurados
-            if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
-              usersDayMatch++;
-              console.log(`[DEBUG] Usuario ${userDoc.id}: Día coincide (${currentDay} está en [${config.dias.join(', ')}])`);
+          // Verificar día y hora
+          if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
+            usersDayMatch++;
+            if (config.hora === currentTime) {
+              usersTimeMatch++;
               
-              // Verificar si la hora coincide
-              if (config.hora === currentTime) {
-                usersTimeMatch++;
-                console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: HORA COINCIDE! (${config.hora} === ${currentTime})`);
-                usersToNotify.push({
+              // Push notifications
+              if (config.tipo === 'push' && pushToken) {
+                usersWithToken++;
+                usersToNotifyPush.push({
                   userId: userDoc.id,
                   token: pushToken,
                   config: config
                 });
-              } else {
-                console.log(`[DEBUG] Usuario ${userDoc.id}: Hora NO coincide (${config.hora} !== ${currentTime})`);
               }
-            } else {
-              console.log(`[DEBUG] Usuario ${userDoc.id}: Día NO coincide (${currentDay} no está en [${config.dias ? config.dias.join(', ') : 'sin días'}])`);
+              
+              // Email notifications
+              if (config.tipo === 'email' && config.email) {
+                usersWithEmail++;
+                usersToNotifyEmail.push({
+                  userId: userDoc.id,
+                  email: config.email,
+                  config: config
+                });
+              }
             }
-          } else {
-            console.log(`[DEBUG] Usuario ${userDoc.id}: No tiene pushToken`);
           }
-        } else {
-          console.log(`[DEBUG] Usuario ${userDoc.id}: Notificaciones inactivas o tipo diferente (activa: ${config.activa}, tipo: ${config.tipo})`);
         }
-      } else {
-        console.log(`[DEBUG] Usuario ${userDoc.id}: No tiene notificationConfig`);
+      }
+    } else {
+      // Usar campos calculados para optimizar
+      for (const userDoc of usersSnapshot.docs) {
+        totalUsers++;
+        const userData = userDoc.data();
+        const pushToken = userData.pushToken;
+        const config = userData.notificationConfig;
+        const notificationType = userData.notificationType || config?.tipo;
+
+        // Verificar si el día actual está en los días configurados
+        const notificationDays = userData.notificationDays || (config?.dias || []);
+        const notificationHour = userData.notificationHour || config?.hora;
+
+        if (Array.isArray(notificationDays) && notificationDays.includes(currentDay)) {
+          usersDayMatch++;
+          
+          // Verificar si la hora coincide
+          if (notificationHour === currentTime) {
+            usersTimeMatch++;
+            
+            // Push notifications
+            if (notificationType === 'push' && pushToken && typeof pushToken === 'string' && pushToken.trim() !== '') {
+              usersWithToken++;
+              console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: PUSH - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
+              usersToNotifyPush.push({
+                userId: userDoc.id,
+                token: pushToken,
+                config: config || {}
+              });
+            }
+            
+            // Email notifications
+            if (notificationType === 'email' && config?.email) {
+              usersWithEmail++;
+              console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: EMAIL - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
+              usersToNotifyEmail.push({
+                userId: userDoc.id,
+                email: config.email,
+                config: config || {}
+              });
+            }
+          }
+        }
       }
     }
 
-    console.log(`[DEBUG] Resumen: Total usuarios: ${totalUsers}, Con config: ${usersWithConfig}, Activos: ${usersActive}, Con token: ${usersWithToken}, Día match: ${usersDayMatch}, Hora match: ${usersTimeMatch}, Para notificar: ${usersToNotify.length}`);
+    console.log(`[DEBUG] Resumen: Total usuarios consultados: ${totalUsers}, Con token: ${usersWithToken}, Con email: ${usersWithEmail}, Día match: ${usersDayMatch}, Hora match: ${usersTimeMatch}, Para notificar push: ${usersToNotifyPush.length}, Para notificar email: ${usersToNotifyEmail.length}`);
 
-    return usersToNotify;
+    return {
+      push: usersToNotifyPush,
+      email: usersToNotifyEmail
+    };
   } catch (error) {
     console.error('Error al obtener usuarios para notificar:', error);
-    return [];
+    // Si falla la consulta optimizada, intentar fallback
+    try {
+      console.log('[DEBUG] Intentando fallback sin campos calculados...');
+      const allUsersSnapshot = await db.collection('users').get();
+      const usersToNotify = [];
+      
+      for (const userDoc of allUsersSnapshot.docs) {
+        const userData = userDoc.data();
+        const config = userData.notificationConfig;
+        const pushToken = userData.pushToken;
+        
+        if (config && config.activa && config.tipo === 'push' && pushToken) {
+          if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
+            if (config.hora === currentTime) {
+              usersToNotify.push({
+                userId: userDoc.id,
+                token: pushToken,
+                config: config
+              });
+            }
+          }
+        }
+      }
+      
+      return usersToNotify;
+    } catch (fallbackError) {
+      console.error('Error en fallback:', fallbackError);
+      return { push: [], email: [] };
+    }
   }
 }
 
-// Función para enviar notificaciones a usuarios
+// Función para enviar emails
+async function enviarEmails(usuariosEmail) {
+  if (!emailTransporter) {
+    console.warn('[EMAIL] Transporter de email no configurado. Saltando envío de emails.');
+    return { enviados: 0, errores: usuariosEmail.length };
+  }
+
+  if (usuariosEmail.length === 0) {
+    return { enviados: 0, errores: 0 };
+  }
+
+  const smtpFrom = process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@bookjournal.com';
+  const title = '📖 Recordatorio de Lectura';
+  const body = 'Es hora de leer tu lectura diaria. ¡No te olvides!';
+  
+  let enviados = 0;
+  let errores = 0;
+
+  for (const usuario of usuariosEmail) {
+    try {
+      const mailOptions = {
+        from: smtpFrom,
+        to: usuario.email,
+        subject: title,
+        text: body,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #667eea;">📖 Recordatorio de Lectura</h2>
+            <p style="font-size: 16px; line-height: 1.6;">
+              Es hora de leer tu lectura diaria. ¡No te olvides!
+            </p>
+            <p style="color: #666; font-size: 14px; margin-top: 30px;">
+              Book Journal - Tu diario de lectura personal
+            </p>
+          </div>
+        `
+      };
+
+      const info = await emailTransporter.sendMail(mailOptions);
+      console.log(`[EMAIL] ✅ Email enviado a ${usuario.email}: ${info.messageId}`);
+      enviados++;
+    } catch (error) {
+      console.error(`[EMAIL] ❌ Error al enviar email a ${usuario.email}:`, error.message);
+      errores++;
+    }
+  }
+
+  console.log(`[EMAIL] Proceso de emails completado. Enviados: ${enviados}, Errores: ${errores}`);
+  return { enviados, errores };
+}
+
+// Función para enviar notificaciones a usuarios (push y email)
 async function enviarNotificacionesProgramadas() {
   console.log(`[${new Date().toISOString()}] Verificando usuarios para notificar...`);
   
   const usersToNotify = await obtenerUsuariosParaNotificar();
+  const usersPush = usersToNotify.push || [];
+  const usersEmail = usersToNotify.email || [];
   
-  if (usersToNotify.length === 0) {
+  if (usersPush.length === 0 && usersEmail.length === 0) {
     console.log('No hay usuarios para notificar en este momento');
     return;
   }
 
-  console.log(`Encontrados ${usersToNotify.length} usuarios para notificar`);
+  console.log(`Encontrados ${usersPush.length} usuarios para notificar por push y ${usersEmail.length} por email`);
 
-  const tokens = usersToNotify.map(u => u.token).filter(t => t); // Filtrar tokens nulos
-  
-  if (tokens.length === 0) {
-    console.log('No hay tokens válidos para enviar');
-    return;
-  }
+  // Enviar notificaciones push
+  if (usersPush.length > 0) {
+    const tokens = usersPush.map(u => u.token).filter(t => t); // Filtrar tokens nulos
+    
+    if (tokens.length > 0) {
+      const title = '📖 Recordatorio de Lectura';
+      const body = 'Es hora de leer tu lectura diaria. ¡No te olvides!';
 
-  const title = '📖 Recordatorio de Lectura';
-  const body = 'Es hora de leer tu lectura diaria. ¡No te olvides!';
+      const MAX_TOKENS_PER_BATCH = 500;
+      const chunks = [];
+      for (let i = 0; i < tokens.length; i += MAX_TOKENS_PER_BATCH) {
+        chunks.push(tokens.slice(i, i + MAX_TOKENS_PER_BATCH));
+      }
 
-  const MAX_TOKENS_PER_BATCH = 500;
-  const chunks = [];
-  for (let i = 0; i < tokens.length; i += MAX_TOKENS_PER_BATCH) {
-    chunks.push(tokens.slice(i, i + MAX_TOKENS_PER_BATCH));
-  }
+      const responses = [];
+      for (const chunk of chunks) {
+        try {
+          const response = await admin.messaging().sendEachForMulticast({
+            notification: {
+              title: title,
+              body: body
+            },
+            tokens: chunk
+          });
+          responses.push(response);
+          console.log(`[PUSH] Notificaciones enviadas a ${response.successCount} de ${chunk.length} dispositivos`);
+        } catch (error) {
+          console.error('[PUSH] Error enviando batch de notificaciones:', error);
+          responses.push({ success: false, error });
+        }
+      }
 
-  const responses = [];
-  for (const chunk of chunks) {
-    try {
-      const response = await admin.messaging().sendEachForMulticast({
-        notification: {
-          title: title,
-          body: body
-        },
-        tokens: chunk
-      });
-      responses.push(response);
-      console.log(`Notificaciones enviadas a ${response.successCount} de ${chunk.length} dispositivos`);
-    } catch (error) {
-      console.error('Error enviando batch de notificaciones:', error);
-      responses.push({ success: false, error });
+      console.log(`[PUSH] Proceso de notificaciones push completado. Total: ${tokens.length} tokens`);
     }
   }
 
-  console.log(`Proceso de notificaciones completado. Total: ${tokens.length} tokens`);
+  // Enviar notificaciones por email
+  if (usersEmail.length > 0) {
+    const resultadoEmail = await enviarEmails(usersEmail);
+    console.log(`[EMAIL] Proceso de emails completado. Enviados: ${resultadoEmail.enviados}, Errores: ${resultadoEmail.errores}`);
+  }
 }
 
-// Configurar cron job para verificar cada minuto
+// Configurar cron job para verificar cada 15 minutos (en :00, :15, :30, :45)
 // El formato es: segundo minuto hora día mes día-semana
-// '* * * * *' = cada minuto
-cron.schedule('* * * * *', async () => {
+// '0 */15 * * * *' = cada 15 minutos en los minutos 0, 15, 30, 45
+// Esto reduce significativamente las consultas a Firestore (de 1440/día a 96/día)
+cron.schedule('0 */15 * * * *', async () => {
   await enviarNotificacionesProgramadas();
 }, {
   scheduled: true,
-  timezone: "America/Argentina/Buenos_Aires" // Ajustar según tu zona horaria
+  timezone: "America/Argentina/Buenos_Aires"
 });
 
-console.log('Cron job configurado para verificar notificaciones cada minuto');
+console.log('Cron job configurado para verificar notificaciones cada 15 minutos (en :00, :15, :30, :45)');
 
 // Obtener el puerto de la variable de entorno o usar 3000 por defecto
 const PORT = process.env.PORT || 3000;

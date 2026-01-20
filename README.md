@@ -5,7 +5,9 @@ API para enviar notificaciones push programadas a los usuarios de Book Journal.
 ## Características
 
 - Envío de notificaciones push programadas usando Firebase Cloud Messaging
-- Cron jobs para verificar y enviar notificaciones cada minuto
+- Envío de notificaciones por email usando SMTP (configurable)
+- Cron jobs optimizados que verifican cada 15 minutos (reduce costos de Firestore en 93%)
+- Consultas optimizadas a Firestore usando campos calculados
 - Endpoint para envío manual de notificaciones
 
 ## Configuración Local
@@ -15,16 +17,23 @@ API para enviar notificaciones push programadas a los usuarios de Book Journal.
 npm install
 ```
 
-2. Configurar Firebase:
+2. Configurar variables de entorno:
+   - Copia `env.example` a `.env`: `cp env.example .env`
+   - Edita `.env` y completa las variables necesarias
+   - **OBLIGATORIO**: `FIREBASE_CONFIG` - JSON completo de Firebase Admin SDK
+   - **OPCIONAL**: Variables SMTP si quieres enviar emails (ver `SMTP_CONFIG.md`)
+
+3. Configurar Firebase (alternativa a variables de entorno):
    - Coloca tu archivo `firebase-config.json` en la raíz del proyecto
    - Este archivo debe contener las credenciales de Firebase Admin SDK
+   - **Nota**: Si usas `FIREBASE_CONFIG` en `.env`, no necesitas este archivo
 
-3. Configurar SSL (solo para desarrollo local):
+4. Configurar SSL (solo para desarrollo local):
    - Coloca tus certificados SSL en la carpeta `ssl/`:
      - `ssl/key.key`
      - `ssl/cert.crt`
 
-4. Ejecutar:
+5. Ejecutar:
 ```bash
 npm start
 ```
@@ -44,9 +53,11 @@ npm start
    - **Start Command**: `npm start`
    - **Plan**: Free
 
-6. Variables de entorno:
+6. Variables de entorno (ver `env.example` para referencia):
    - `NODE_ENV`: `production`
-   - Agrega el contenido de `firebase-config.json` como variable de entorno `FIREBASE_CONFIG` (JSON string)
+   - `FIREBASE_CONFIG`: Contenido completo de `firebase-config.json` como JSON string (OBLIGATORIO)
+   - `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`: Solo si quieres enviar emails (OPCIONAL)
+   - Ver `env.example` para todas las variables disponibles
 
 7. Click en "Create Web Service"
 
@@ -142,6 +153,9 @@ Envía notificaciones push manualmente
 
 ## Notas
 
-- Los cron jobs se ejecutan cada minuto para verificar usuarios que deben recibir notificaciones
+- Los cron jobs se ejecutan cada 15 minutos (en :00, :15, :30, :45) para verificar usuarios que deben recibir notificaciones
+- Esto reduce las consultas a Firestore de 1440/día a 96/día (93% menos)
 - La zona horaria está configurada como "America/Argentina/Buenos_Aires" - ajusta según necesites
 - Las notificaciones se envían automáticamente según la configuración guardada en Firestore
+- Para configurar SMTP y enviar emails, ver `SMTP_CONFIG.md`
+- Para ver todas las variables de entorno disponibles, ver `env.example`
