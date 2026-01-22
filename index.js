@@ -70,6 +70,72 @@ function inicializarEmailTransporter() {
 // Inicializar transporter al arrancar
 inicializarEmailTransporter();
 
+// Función para verificar/crear índice compuesto en Firestore
+// Esta función ejecuta una consulta que requiere el índice compuesto
+// Si el índice no existe, Firestore mostrará un error con un enlace para crearlo
+async function verificarIndiceCompuesto() {
+  const db = admin.firestore();
+  
+  try {
+    console.log('[ÍNDICE] Verificando índice compuesto en Firestore...');
+    console.log('[ÍNDICE] Collection: users');
+    console.log('[ÍNDICE] Campos: notificationActive (Ascending), notificationType (Ascending)');
+    
+    // Realizar una consulta que requiera el índice compuesto
+    // Esta consulta usa múltiples where() que requieren un índice compuesto
+    // Intentamos consultas para ambos tipos de notificación (push y email)
+    const queries = [
+      db.collection('users')
+        .where('notificationActive', '==', true)
+        .where('notificationType', '==', 'push')
+        .limit(1),
+      db.collection('users')
+        .where('notificationActive', '==', true)
+        .where('notificationType', '==', 'email')
+        .limit(1)
+    ];
+    
+    // Ejecutar ambas consultas para asegurar que el índice se detecte
+    for (const query of queries) {
+      await query.get();
+    }
+    
+    console.log('[ÍNDICE] ✅ Índice compuesto existe o no es necesario');
+  } catch (error) {
+    if (error.code === 8 || error.message.includes('index') || error.message.includes('FAILED_PRECONDITION')) {
+      // Error 8 es "FAILED_PRECONDITION" que indica que falta un índice
+      console.error('');
+      console.error('═══════════════════════════════════════════════════════════');
+      console.error('[ÍNDICE] ⚠️  ÍNDICE COMPUESTO REQUERIDO');
+      console.error('[ÍNDICE] Firestore requiere crear un índice compuesto para esta consulta.');
+      console.error('[ÍNDICE] Collection: users');
+      console.error('[ÍNDICE] Campos: notificationActive (Ascending), notificationType (Ascending)');
+      console.error('');
+      console.error('[ÍNDICE] Busca en el error siguiente el enlace para crear el índice automáticamente:');
+      console.error('[ÍNDICE] Error:', error.message);
+      console.error('');
+      
+      // Extraer URL del error si existe
+      const urlMatch = error.message.match(/https:\/\/[^\s\)]+/);
+      if (urlMatch) {
+        console.error('[ÍNDICE] 🔗 ENLACE PARA CREAR ÍNDICE:');
+        console.error('[ÍNDICE]', urlMatch[0]);
+        console.error('');
+      }
+      
+      console.error('═══════════════════════════════════════════════════════════');
+      console.error('');
+    } else {
+      console.error('[ÍNDICE] Error al verificar índice:', error.message);
+    }
+  }
+}
+
+// Ejecutar verificación de índice al iniciar (después de inicializar Firebase)
+verificarIndiceCompuesto().catch(err => {
+  console.error('[ÍNDICE] Error en verificación de índice:', err);
+});
+
 const app = express();
 
 // Configurar CORS
@@ -204,29 +270,49 @@ function getDateInTimezone(timezone = 'America/Argentina/Buenos_Aires') {
 // NOTA: Para mejor rendimiento, crear un índice compuesto en Firestore:
 // Collection: users
 // Fields: notificationActive (Ascending), notificationType (Ascending)
+// Función auxiliar para normalizar el formato de hora (asegurar formato HH:MM)
+function normalizarHora(hora) {
+  if (!hora) return null;
+  const horaStr = String(hora).trim();
+  // Si ya está en formato HH:MM, retornarlo
+  if (/^\d{2}:\d{2}$/.test(horaStr)) {
+    return horaStr;
+  }
+  // Si está en formato H:MM o H:M, agregar cero al inicio
+  if (/^\d{1,2}:\d{1,2}$/.test(horaStr)) {
+    const [h, m] = horaStr.split(':');
+    return `${h.padStart(2, '0')}:${m.padStart(2, '0')}`;
+  }
+  return horaStr;
+}
+
 async function obtenerUsuariosParaNotificar() {
   const db = admin.firestore();
   const TIMEZONE = 'America/Argentina/Buenos_Aires';
   const timeInfo = getDateInTimezone(TIMEZONE);
   const currentDay = timeInfo.day;
-  const currentTime = timeInfo.timeString;
+  const currentTime = normalizarHora(timeInfo.timeString);
 
-  console.log(`[DEBUG] Zona horaria: ${TIMEZONE}`);
-  console.log(`[DEBUG] Fecha/hora local: ${timeInfo.fullString}`);
-  console.log(`[DEBUG] Día de la semana: ${currentDay} (0=Dom, 1=Lun, 2=Mar, etc.)`);
-  console.log(`[DEBUG] Hora actual: ${currentTime}`);
+  console.log(`[CRON] ========================================`);
+  console.log(`[CRON] Verificando usuarios para notificar...`);
+  console.log(`[CRON] Zona horaria: ${TIMEZONE}`);
+  console.log(`[CRON] Fecha/hora local: ${timeInfo.fullString}`);
+  console.log(`[CRON] Día de la semana: ${currentDay} (0=Dom, 1=Lun, 2=Mar, etc.)`);
+  console.log(`[CRON] Hora actual (normalizada): ${currentTime}`);
 
   try {
-    // OPTIMIZACIÓN: Usar consultas de Firestore para filtrar antes de traer datos
-    // Obtener usuarios con notificaciones activas (tanto push como email)
-    // Usamos los campos calculados: notificationActive
-    // Nota: Firestore no permite múltiples where() con != null, así que filtramos pushToken/email después
-    
-    // Obtener usuarios con notificaciones activas (push o email)
-    let usersQuery = db.collection('users')
-      .where('notificationActive', '==', true);
-
-    const usersSnapshot = await usersQuery.get();
+    // Intentar primero con campos calculados (optimización)
+    let usersSnapshot;
+    try {
+      const usersQuery = db.collection('users')
+        .where('notificationActive', '==', true);
+      usersSnapshot = await usersQuery.get();
+      console.log(`[CRON] Consulta con campos calculados: ${usersSnapshot.size} usuarios encontrados`);
+    } catch (queryError) {
+      // Si falla la consulta (por ejemplo, falta índice), usar fallback
+      console.log(`[CRON] ⚠️  Consulta con campos calculados falló, usando fallback:`, queryError.message);
+      usersSnapshot = { empty: true, docs: [] };
+    }
     
     // Si no hay resultados con los campos calculados, hacer fallback a consulta completa
     // (para usuarios antiguos que no tienen los campos calculados)
@@ -239,11 +325,13 @@ async function obtenerUsuariosParaNotificar() {
     let usersWithEmail = 0;
     let usersDayMatch = 0;
     let usersTimeMatch = 0;
+    let usersHoraNoCoincide = 0;
 
     if (usersSnapshot.empty) {
-      console.log('[DEBUG] No se encontraron usuarios con campos calculados, usando fallback...');
+      console.log('[CRON] No se encontraron usuarios con campos calculados, usando fallback...');
       // Fallback: consulta completa pero filtrada
       const allUsersSnapshot = await db.collection('users').get();
+      console.log(`[CRON] Total usuarios en BD: ${allUsersSnapshot.size}`);
       
       for (const userDoc of allUsersSnapshot.docs) {
         totalUsers++;
@@ -255,15 +343,17 @@ async function obtenerUsuariosParaNotificar() {
           usersWithConfig++;
           usersActive++;
           
-          // Verificar día y hora
+          // Verificar día y hora (normalizar hora del usuario)
+          const horaUsuario = normalizarHora(config.hora);
           if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
             usersDayMatch++;
-            if (config.hora === currentTime) {
+            if (horaUsuario === currentTime) {
               usersTimeMatch++;
               
               // Push notifications
-              if (config.tipo === 'push' && pushToken) {
+              if (config.tipo === 'push' && pushToken && typeof pushToken === 'string' && pushToken.trim() !== '') {
                 usersWithToken++;
+                console.log(`[CRON] ✅ Usuario ${userDoc.id}: PUSH - HORA COINCIDE! (${horaUsuario} === ${currentTime})`);
                 usersToNotifyPush.push({
                   userId: userDoc.id,
                   token: pushToken,
@@ -274,12 +364,16 @@ async function obtenerUsuariosParaNotificar() {
               // Email notifications
               if (config.tipo === 'email' && config.email) {
                 usersWithEmail++;
+                console.log(`[CRON] ✅ Usuario ${userDoc.id}: EMAIL - HORA COINCIDE! (${horaUsuario} === ${currentTime})`);
                 usersToNotifyEmail.push({
                   userId: userDoc.id,
                   email: config.email,
                   config: config
                 });
               }
+            } else {
+              usersHoraNoCoincide++;
+              console.log(`[CRON] ⏰ Usuario ${userDoc.id}: Día OK pero hora NO coincide (${horaUsuario} !== ${currentTime})`);
             }
           }
         }
@@ -295,19 +389,19 @@ async function obtenerUsuariosParaNotificar() {
 
         // Verificar si el día actual está en los días configurados
         const notificationDays = userData.notificationDays || (config?.dias || []);
-        const notificationHour = userData.notificationHour || config?.hora;
+        const notificationHour = normalizarHora(userData.notificationHour || config?.hora);
 
         if (Array.isArray(notificationDays) && notificationDays.includes(currentDay)) {
           usersDayMatch++;
           
-          // Verificar si la hora coincide
+          // Verificar si la hora coincide (comparar horas normalizadas)
           if (notificationHour === currentTime) {
             usersTimeMatch++;
             
             // Push notifications
             if (notificationType === 'push' && pushToken && typeof pushToken === 'string' && pushToken.trim() !== '') {
               usersWithToken++;
-              console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: PUSH - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
+              console.log(`[CRON] ✅ Usuario ${userDoc.id}: PUSH - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
               usersToNotifyPush.push({
                 userId: userDoc.id,
                 token: pushToken,
@@ -318,53 +412,81 @@ async function obtenerUsuariosParaNotificar() {
             // Email notifications
             if (notificationType === 'email' && config?.email) {
               usersWithEmail++;
-              console.log(`[DEBUG] ✅ Usuario ${userDoc.id}: EMAIL - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
+              console.log(`[CRON] ✅ Usuario ${userDoc.id}: EMAIL - HORA COINCIDE! (${notificationHour} === ${currentTime})`);
               usersToNotifyEmail.push({
                 userId: userDoc.id,
                 email: config.email,
                 config: config || {}
               });
             }
+          } else {
+            usersHoraNoCoincide++;
+            console.log(`[CRON] ⏰ Usuario ${userDoc.id}: Día OK pero hora NO coincide (${notificationHour} !== ${currentTime})`);
           }
         }
       }
     }
 
-    console.log(`[DEBUG] Resumen: Total usuarios consultados: ${totalUsers}, Con token: ${usersWithToken}, Con email: ${usersWithEmail}, Día match: ${usersDayMatch}, Hora match: ${usersTimeMatch}, Para notificar push: ${usersToNotifyPush.length}, Para notificar email: ${usersToNotifyEmail.length}`);
+    console.log(`[CRON] Resumen:`);
+    console.log(`[CRON]   - Total usuarios consultados: ${totalUsers}`);
+    console.log(`[CRON]   - Con configuración activa: ${usersActive}`);
+    console.log(`[CRON]   - Día coincide: ${usersDayMatch}`);
+    console.log(`[CRON]   - Hora coincide: ${usersTimeMatch}`);
+    console.log(`[CRON]   - Hora NO coincide: ${usersHoraNoCoincide}`);
+    console.log(`[CRON]   - Con pushToken válido: ${usersWithToken}`);
+    console.log(`[CRON]   - Con email válido: ${usersWithEmail}`);
+    console.log(`[CRON]   - Para notificar PUSH: ${usersToNotifyPush.length}`);
+    console.log(`[CRON]   - Para notificar EMAIL: ${usersToNotifyEmail.length}`);
+    console.log(`[CRON] ========================================`);
 
     return {
       push: usersToNotifyPush,
       email: usersToNotifyEmail
     };
   } catch (error) {
-    console.error('Error al obtener usuarios para notificar:', error);
-    // Si falla la consulta optimizada, intentar fallback
+    console.error('[CRON] ❌ Error al obtener usuarios para notificar:', error);
+    // Si falla la consulta optimizada, intentar fallback completo
     try {
-      console.log('[DEBUG] Intentando fallback sin campos calculados...');
+      console.log('[CRON] Intentando fallback completo sin campos calculados...');
       const allUsersSnapshot = await db.collection('users').get();
-      const usersToNotify = [];
+      const usersToNotifyPush = [];
+      const usersToNotifyEmail = [];
       
       for (const userDoc of allUsersSnapshot.docs) {
         const userData = userDoc.data();
         const config = userData.notificationConfig;
         const pushToken = userData.pushToken;
         
-        if (config && config.activa && config.tipo === 'push' && pushToken) {
+        if (config && config.activa) {
+          const horaUsuario = normalizarHora(config.hora);
           if (config.dias && Array.isArray(config.dias) && config.dias.includes(currentDay)) {
-            if (config.hora === currentTime) {
-              usersToNotify.push({
-                userId: userDoc.id,
-                token: pushToken,
-                config: config
-              });
+            if (horaUsuario === currentTime) {
+              // Push notifications
+              if (config.tipo === 'push' && pushToken && typeof pushToken === 'string' && pushToken.trim() !== '') {
+                usersToNotifyPush.push({
+                  userId: userDoc.id,
+                  token: pushToken,
+                  config: config
+                });
+              }
+              
+              // Email notifications
+              if (config.tipo === 'email' && config.email) {
+                usersToNotifyEmail.push({
+                  userId: userDoc.id,
+                  email: config.email,
+                  config: config
+                });
+              }
             }
           }
         }
       }
       
-      return usersToNotify;
+      console.log(`[CRON] Fallback: ${usersToNotifyPush.length} push, ${usersToNotifyEmail.length} email`);
+      return { push: usersToNotifyPush, email: usersToNotifyEmail };
     } catch (fallbackError) {
-      console.error('Error en fallback:', fallbackError);
+      console.error('[CRON] ❌ Error en fallback:', fallbackError);
       return { push: [], email: [] };
     }
   }
@@ -423,18 +545,22 @@ async function enviarEmails(usuariosEmail) {
 
 // Función para enviar notificaciones a usuarios (push y email)
 async function enviarNotificacionesProgramadas() {
-  console.log(`[${new Date().toISOString()}] Verificando usuarios para notificar...`);
+  console.log(`\n[CRON] ========================================`);
+  console.log(`[CRON] 🕐 Ejecutando cron job: ${new Date().toISOString()}`);
+  console.log(`[CRON] ========================================\n`);
   
   const usersToNotify = await obtenerUsuariosParaNotificar();
   const usersPush = usersToNotify.push || [];
   const usersEmail = usersToNotify.email || [];
   
   if (usersPush.length === 0 && usersEmail.length === 0) {
-    console.log('No hay usuarios para notificar en este momento');
+    console.log('[CRON] ℹ️  No hay usuarios para notificar en este momento\n');
     return;
   }
 
-  console.log(`Encontrados ${usersPush.length} usuarios para notificar por push y ${usersEmail.length} por email`);
+  console.log(`[CRON] 📤 Enviando notificaciones:`);
+  console.log(`[CRON]   - Push: ${usersPush.length} usuarios`);
+  console.log(`[CRON]   - Email: ${usersEmail.length} usuarios\n`);
 
   // Enviar notificaciones push
   if (usersPush.length > 0) {
